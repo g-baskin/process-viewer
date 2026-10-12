@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Process Viewer</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="toolbar">
+    <div class="tabs" role="tablist">
+      <button class="tab active" data-view="apps" role="tab">Apps</button>
+      <button class="tab" data-view="tree" role="tab">Tree</button>
+      <button class="tab" data-view="all" role="tab">All processes</button>
+      <button class="tab" data-view="startup" role="tab">Startup</button>
+    </div>
+    <input id="search" type="search" placeholder="Search name, PID, app or path…" autocomplete="off" spellcheck="false" />
+    <label class="toggle" title="Show macOS system processes">
+      <input type="checkbox" id="show-system" /> System processes
+    </label>
+    <label class="toggle" title="Refresh every 2 seconds">
+      <input type="checkbox" id="live" checked /> Live
+    </label>
+    <button id="refresh" class="btn" title="Refresh now (⌘R)">Refresh</button>
+  </header>
+
+  <main>
+    <section class="list-pane">
+      <div class="list-head" id="list-head">
+        <span class="col-name sortable" data-sort="name">Name</span>
+        <span class="col-pid sortable" data-sort="pid">PID</span>
+        <span class="col-cpu sortable" data-sort="cpu">CPU</span>
+        <span class="col-mem sortable" data-sort="memory">Memory</span>
+        <span class="col-user sortable" data-sort="user">User</span>
+      </div>
+      <div id="list" class="list" tabindex="0"></div>
+      <footer id="status" class="status"></footer>
+    </section>
+
+    <aside id="detail" class="detail-pane">
+      <div class="empty">Select a process to see what it is, what started it, and to stop it.</div>
+    </aside>
+  </main>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <dialog id="confirm">
+    <form method="dialog">
+      <h3 id="confirm-title"></h3>
+      <p id="confirm-body"></p>
+      <div class="dialog-actions">
+        <button value="cancel" class="btn">Cancel</button>
+        <button value="ok" id="confirm-ok" class="btn danger">Stop</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="main.js"></script>
+</body>
+</html>
