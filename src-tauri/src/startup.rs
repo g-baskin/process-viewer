@@ -240,7 +240,7 @@ pub fn list(procs: &[RunningProc]) -> Vec<StartupItem> {
             });
         }
     }
-    items.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    items.sort_by_key(|a| a.label.to_lowercase());
     items
 }
 
