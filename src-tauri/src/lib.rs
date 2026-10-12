@@ -63,7 +63,7 @@ struct Proc {
     memory: u64,
     start_time: u64,
     run_time: u64,
-    /// "app" | "menubar" | "helper" | "service" | "system"
+    /// "app" | "menubar" | "helper" | "background" | "system"
     kind: &'static str,
     /// The open app this process belongs to (itself for apps).
     app_pid: Option<u32>,
@@ -264,7 +264,7 @@ fn build_snapshot(state: &AppState, apps: Vec<RunningApp>) -> Result<Snapshot, S
                 if system {
                     "system"
                 } else {
-                    "service"
+                    "background"
                 }
             }
         };

@@ -2,6 +2,7 @@
 name = "process-app"
 version = "0.1.0"
 description = "See what's running on your Mac, who started it, and stop it."
+license = "MIT"
 edition = "2021"
 rust-version = "1.90"
 resolver = "3"

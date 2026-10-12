@@ -2,3 +2,9 @@ node_modules/
 src-tauri/target/
 src-tauri/gen/
 .DS_Store
+
+# Local settings, logs and agent tooling
+.env
+.env.*
+*.log
+.gg/

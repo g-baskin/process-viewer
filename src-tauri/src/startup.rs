@@ -13,7 +13,7 @@ pub struct StartupItem {
     pub program: Option<String>,
     pub arguments: Vec<String>,
     /// "user" (~/Library/LaunchAgents), "all-users" (/Library/LaunchAgents),
-    /// "system" (/Library/LaunchDaemons, runs as root).
+    /// "system-service" (/Library/LaunchDaemons, runs as root).
     pub scope: &'static str,
     pub enabled: bool,
     /// When it runs, in plain words.
@@ -29,7 +29,7 @@ fn dirs() -> Vec<(PathBuf, &'static str)> {
         v.push((Path::new(&home).join("Library/LaunchAgents"), "user"));
     }
     v.push((PathBuf::from("/Library/LaunchAgents"), "all-users"));
-    v.push((PathBuf::from("/Library/LaunchDaemons"), "system"));
+    v.push((PathBuf::from("/Library/LaunchDaemons"), "system-service"));
     v
 }
 
@@ -63,7 +63,7 @@ fn overrides(domain: &str) -> HashMap<String, bool> {
 }
 
 fn when_text(d: &plist::Dictionary, scope: &str) -> String {
-    let at = if scope == "system" {
+    let at = if scope == "system-service" {
         "at startup"
     } else {
         "at login"
@@ -212,13 +212,13 @@ pub fn list(procs: &[RunningProc]) -> Vec<StartupItem> {
                 .map(str::to_string)
                 .or_else(|| arguments.first().cloned());
             let plist_disabled = matches!(d.get("Disabled"), Some(plist::Value::Boolean(true)));
-            let over = if scope == "system" {
+            let over = if scope == "system-service" {
                 &sys_over
             } else {
                 &user_over
             };
             let enabled = !over.get(&label).copied().unwrap_or(plist_disabled);
-            let running_pid = if scope == "system" {
+            let running_pid = if scope == "system-service" {
                 program
                     .as_deref()
                     .and_then(|p| match_by_program(p, &arguments, procs))
@@ -264,9 +264,9 @@ pub fn set_enabled(label: &str, enable: bool) -> Result<String, String> {
         .ok_or("That startup item no longer exists.")?;
     let plist_path = item.plist.clone();
 
-    if item.scope == "system" && crate::privhelper::ready() {
+    if item.scope == "system-service" && crate::privhelper::ready() {
         crate::privhelper::toggle(label, &plist_path, enable)?;
-    } else if item.scope == "system" {
+    } else if item.scope == "system-service" {
         // Needs root: ask macOS for the admin password. The label was checked
         // above; the plist path comes from our own listing of /Library/LaunchDaemons.
         let quoted = plist_path.replace('\'', "");
@@ -319,7 +319,7 @@ pub fn set_enabled(label: &str, enable: bool) -> Result<String, String> {
     Ok(if enable {
         format!(
             "Turned on “{label}”. It will start {}.",
-            if item.scope == "system" {
+            if item.scope == "system-service" {
                 "at startup"
             } else {
                 "at login"
@@ -377,7 +377,7 @@ mod tests {
         d.insert("KeepAlive".into(), true.into());
         d.insert("StartInterval".into(), plist::Value::Integer(3600.into()));
         assert_eq!(
-            when_text(&d, "system"),
+            when_text(&d, "system-service"),
             "Starts at startup and is kept running, every 1 hour(s)"
         );
     }

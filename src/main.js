@@ -51,9 +51,9 @@ function fmtDuration(s) {
 }
 const KIND_LABEL = {
   app: "App",
-  menubar: "Menu bar / background app",
+  menubar: "Menu bar app",
   helper: "App helper",
-  service: "Background program",
+  background: "Background program",
   system: "macOS system",
 };
 
@@ -163,16 +163,16 @@ async function loadStartup() {
 const SCOPE_TITLE = {
   user: "Starts when you log in (just for you)",
   "all-users": "Starts when anyone logs in",
-  system: "System services (start with the Mac, run as administrator)",
+  "system-service": "System services (start with the Mac, run as administrator)",
 };
-const SCOPE_SHORT = { user: "Login item (you)", "all-users": "Login item (all users)", system: "System service" };
+const SCOPE_SHORT = { user: "Launch agent (you)", "all-users": "Launch agent (all users)", "system-service": "System service" };
 
 function renderStartup(frag, q) {
   if (!state.startup) { frag.append(el("div", "empty", "Loading…")); return; }
   frag.append(el("div", "intro",
     "Programs that apps and installers set up to start automatically. Apple's own are not shown. " +
     "Turning one off stops it starting next time; you can turn it back on here."));
-  const hasSystem = state.startup.some((i) => i.scope === "system");
+  const hasSystem = state.startup.some((i) => i.scope === "system-service");
   if (hasSystem) {
     const bar = el("div", "intro helper-bar");
     if (state.helperReady) {
@@ -192,7 +192,7 @@ function renderStartup(frag, q) {
     i.label.toLowerCase().includes(q) ||
     (i.vendor || "").toLowerCase().includes(q) ||
     (i.program || "").toLowerCase().includes(q));
-  for (const scope of ["user", "all-users", "system"]) {
+  for (const scope of ["user", "all-users", "system-service"]) {
     const list = items.filter((i) => i.scope === scope);
     if (!list.length) continue;
     frag.append(el("div", "section-head", `${SCOPE_TITLE[scope]} (${list.length})`));
@@ -238,7 +238,7 @@ function renderStartupDetail(pane) {
 
   let desc = i.vendor ? `Installed by ${i.vendor}. ` : "";
   desc += i.when + ".";
-  if (i.scope === "system") desc += " It runs as the administrator (root), even when nobody is logged in.";
+  if (i.scope === "system-service") desc += " It runs as the administrator (root), even when nobody is logged in.";
   if (!i.program_exists && i.program) desc += " Its program file is missing, so it probably belongs to software that was removed. It's safe to turn off.";
   out.append(el("div", "d-desc", desc));
 
@@ -291,7 +291,7 @@ function renderStartupDetail(pane) {
   btn.onclick = () => toggleStartup(i);
   actions.append(btn);
   out.append(actions);
-  out.append(el("div", "note", i.scope === "system"
+  out.append(el("div", "note", i.scope === "system-service"
     ? (state.helperReady ? "No password needed (set up at the top of this tab). " : "macOS will ask for your password. ") + "Be careful with security, VPN and company-managed software (antivirus, FortiClient, Duo and similar): turning those off can break things or go against your workplace's rules."
     : "Turning it off stops it now and stops it starting at login. The app it belongs to may stop working fully until you turn it back on."));
   pane.replaceChildren(out);
@@ -300,9 +300,9 @@ function renderStartupDetail(pane) {
 async function installHelper() {
   const ok = await confirmDialog(
     "Stop asking for your password?",
-    "macOS will ask for your password one last time. After that, Process Viewer can turn system startup services on and off straight away. " +
-    "It installs a small helper that can only switch third-party services in /Library/LaunchDaemons on or off (never Apple's), " +
-    "and a rule letting your account run just that helper. You can undo this here at any time.",
+    "macOS will ask for your password one last time. After that, Process Viewer can turn system services on and off straight away. " +
+    "It installs a small startup helper that can only switch third-party system services in /Library/LaunchDaemons on or off (never Apple's), " +
+    "and a rule letting your account run just the startup helper. You can undo this here at any time.",
     "Set it up",
   );
   if (!ok) return;
@@ -319,7 +319,7 @@ async function installHelper() {
 async function removeHelper() {
   const ok = await confirmDialog(
     "Ask for the password again?",
-    "This removes the helper and the rule. macOS will ask for your password to do it, and again each time you switch a system service.",
+    "This removes the startup helper and the rule. macOS will ask for your password to do it, and again each time you switch a system service.",
     "Remove",
   );
   if (!ok) return;
@@ -335,14 +335,31 @@ async function removeHelper() {
 
 async function toggleStartup(i) {
   const enable = !i.enabled;
-  const ok = await confirmDialog(
+  // System services need root. Until the startup helper is set up, offer it
+  // right here so this is the last time macOS asks for the password.
+  const offerHelper = i.scope === "system-service" && !state.helperReady;
+  const choice = await confirmDialog(
     enable ? `Turn on “${i.label}”?` : `Turn off “${i.label}”?`,
     enable
       ? "It will start now and every time it's meant to."
       : "It will stop now and won't start automatically any more. You can turn it back on here.",
     enable ? "Turn on" : "Turn off",
+    offerHelper
+      ? "Don't ask for my password again. macOS asks once more now to install the startup helper, which can only switch third-party system services (never Apple's). You can undo this at the top of this tab."
+      : null,
   );
-  if (!ok) return;
+  if (!choice) return;
+  if (choice === "ok+option") {
+    try {
+      await invoke("install_startup_helper");
+      state.helperReady = true;
+    } catch (e) {
+      toast(String(e), true);
+      await loadStartup();
+      render();
+      return;
+    }
+  }
   try {
     toast(await invoke("set_startup", { label: i.label, enable }));
   } catch (e) {
@@ -352,14 +369,28 @@ async function toggleStartup(i) {
   await refresh();
 }
 
-function confirmDialog(title, body, okLabel) {
+/**
+ * Resolves to false (cancelled), "ok", or "ok+option" when the optional
+ * checkbox was shown and ticked.
+ * @param {string} title @param {string} body @param {string} okLabel
+ * @param {string | null} [option] checkbox text; ticked by default
+ */
+function confirmDialog(title, body, okLabel, option = null) {
   $("#confirm-title").textContent = title;
   $("#confirm-body").textContent = body;
   $("#confirm-ok").textContent = okLabel;
+  const opt = $("#confirm-option");
+  const box = $("#confirm-option-box");
+  opt.hidden = !option;
+  $("#confirm-option-text").textContent = option || "";
+  box.checked = Boolean(option);
   const dlg = $("#confirm");
   dlg.returnValue = "";
   dlg.showModal();
-  return new Promise((res) => dlg.addEventListener("close", () => res(dlg.returnValue === "ok"), { once: true }));
+  return new Promise((res) => dlg.addEventListener("close", () => {
+    if (dlg.returnValue !== "ok") return res(false);
+    res(option && box.checked ? "ok+option" : "ok");
+  }, { once: true }));
 }
 
 function switchView(view) {
@@ -537,13 +568,13 @@ function renderApps(frag, q) {
   };
 
   section("Apps", groupOf("app"));
-  section("Menu bar & background apps", groupOf("menubar"));
+  section("Menu bar apps", groupOf("menubar"));
 
   const others = procs
-    .filter((p) => p.kind === "service" || (state.showSystem && p.kind === "system"))
+    .filter((p) => p.kind === "background" || (state.showSystem && p.kind === "system"))
     .filter((p) => matches(p, q))
     .sort(sort);
-  const services = others.filter((p) => p.kind === "service");
+  const services = others.filter((p) => p.kind === "background");
   const system = others.filter((p) => p.kind === "system");
   if (services.length) {
     frag.append(el("div", "section-head", `Other background programs (${services.length})`));
@@ -756,7 +787,7 @@ function renderDetail() {
         ? `Stopping a helper can make part of ${p.app_name || "its app"} stop working or reload. The app may start it again.`
         : p.kind === "system"
           ? "This is part of macOS. It's usually safe to leave alone; macOS will often restart it if stopped."
-          : "End process asks it to stop cleanly. Force quit stops it straight away. Background services may be restarted automatically.";
+          : "End process asks it to stop cleanly. Force quit stops it straight away. Background programs may be restarted automatically.";
     out.append(el("div", "note", note));
   }
 

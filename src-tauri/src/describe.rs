@@ -212,7 +212,7 @@ pub fn describe(c: &Ctx) -> String {
                 .into();
         }
         if let Some(vendor) = vendor_from_path(exe).or_else(|| vendor_from_reverse_dns(c.name)) {
-            return format!("A background service installed by {vendor}.");
+            return format!("A background program installed by {vendor}.");
         }
         if exe.contains("/.cargo/") || exe.contains("/.rustup/") {
             return "A Rust development tool.".into();
@@ -227,14 +227,14 @@ pub fn describe(c: &Ctx) -> String {
         }
     }
     if let Some(vendor) = vendor_from_reverse_dns(c.name) {
-        return format!("A background service installed by {vendor}.");
+        return format!("A background program installed by {vendor}.");
     }
     if c.is_root {
-        return "A background service running as the system administrator (root).".into();
+        return "A background program running as the system administrator (root).".into();
     }
     if c.name.ends_with('d') && c.name.len() > 2 && c.name.chars().all(|ch| ch.is_ascii_lowercase())
     {
-        return "A background service (daemon). On macOS, names ending in “d” are usually daemons."
+        return "A background program (daemon). On macOS, names ending in “d” are usually daemons."
             .into();
     }
     "A background process. Use “Search the web” to find out more.".into()
@@ -325,19 +325,19 @@ mod tests {
         let d = describe(&Ctx {
             name: "foo",
             exe: Some("/Library/Application Support/Acme/foo"),
-            kind: "service",
+            kind: "background",
             app_name: None,
             is_root: false,
         });
-        assert_eq!(d, "A background service installed by Acme.");
+        assert_eq!(d, "A background program installed by Acme.");
         let d = describe(&Ctx {
             name: "com.wacom.DataStoreMgr",
             exe: Some("/Library/Application Support/Tablet/com.wacom.DataStoreMgr.app/Contents/MacOS/com.wacom.DataStoreMgr"),
-            kind: "service",
+            kind: "background",
             app_name: None,
             is_root: false,
         });
-        assert_eq!(d, "A background service installed by Tablet.");
+        assert_eq!(d, "A background program installed by Tablet.");
         assert_eq!(
             vendor_from_reverse_dns("com.surfshark.vpnclient.macos").as_deref(),
             Some("Surfshark")

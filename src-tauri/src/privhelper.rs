@@ -130,7 +130,7 @@ pub fn install() -> Result<(), String> {
     );
     let r = run_as_admin(
         &shell,
-        "Process Viewer wants to turn system startup items on and off without asking for your password each time. You only need to do this once.",
+        "Process Viewer wants to turn system services on and off without asking for your password each time. You only need to do this once.",
     );
     let _ = std::fs::remove_dir_all(&dir);
     r?;
@@ -144,11 +144,11 @@ pub fn install() -> Result<(), String> {
 pub fn remove() -> Result<(), String> {
     run_as_admin(
         &format!("/bin/rm -f '{SUDOERS}' '{HELPER}'"),
-        "Process Viewer wants to remove its permission to manage system startup items.",
+        "Process Viewer wants to remove its permission to manage system services.",
     )
 }
 
-/// Turn a system daemon on or off through the helper, without a prompt.
+/// Turn a system service on or off through the startup helper, without a prompt.
 pub fn toggle(label: &str, plist: &str, enable: bool) -> Result<(), String> {
     if !Path::new(plist).starts_with("/Library/LaunchDaemons") {
         return Err("Only items in /Library/LaunchDaemons can be changed this way.".into());

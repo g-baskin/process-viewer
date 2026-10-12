@@ -4,21 +4,25 @@ A macOS desktop app (Tauri 2 + Rust) that shows what's running on your Mac,
 what each process is, which program is running it, and lets you stop it.
 
 ## Views
-- **Apps**: your open apps (Dock apps, then third-party menu bar apps), each
-  with its helper processes folded underneath and their CPU/memory added up.
+- **Apps**: your open apps (Dock apps, then menu bar apps), each
+  with its app helpers folded underneath and their CPU/memory added up.
   Below them, other background programs, plus macOS system processes when
   "System processes" is ticked.
 - **Tree**: every process under the process that launched it.
 - **All processes**: a flat sortable list.
-- **Startup**: programs set to start automatically (login items and system
-  services from LaunchAgents/LaunchDaemons, Apple's own left out), whether
-  they're on and running, and a button to turn each one off or on.
+- **Startup**: startup items, i.e. programs set to start automatically
+  (launch agents from LaunchAgents and system services from LaunchDaemons,
+  Apple's own left out), whether they're on and running, and a button to turn
+  each one off or on.
   System services normally need your password each time; "Stop asking for my
-  password…" (top of the Startup tab) asks once and installs a tiny root helper
+  password…" (top of the Startup tab) asks once and installs the startup helper
   (/Library/PrivilegedHelperTools/com.dellcbyer.processviewer.startup-helper)
   plus a sudoers rule (/etc/sudoers.d/process-viewer) allowing only that helper.
-  The helper only switches third-party plists in /Library/LaunchDaemons whose
-  Label matches. "Turn this off" removes both.
+  The startup helper only switches third-party plists in /Library/LaunchDaemons
+  whose Label matches. "Turn this off" removes both. Why: see
+  [docs/adr/0001](docs/adr/0001-startup-helper-with-sudoers-rule.md).
+
+Terms used in code, UI and docs are defined in [CONTEXT.md](CONTEXT.md).
 
 The detail pane shows live CPU and memory graphs (last 3 minutes, app +
 helpers for apps); the status bar shows total CPU.
@@ -45,7 +49,13 @@ npm install
 npm run dev      # run in development
 npm run build    # makes src-tauri/target/release/bundle/macos/Process Viewer.app and a .dmg
 ```
-`src-tauri/target/debug/process-app --dump` prints one snapshot as JSON (debugging).
+`src-tauri/target/debug/process-app --dump` prints one snapshot as JSON, and
+`--dump-startup` prints the startup items as JSON (debugging).
+
+## Test
+```sh
+cd src-tauri && cargo test
+```
 
 The app is ad-hoc signed (no Apple Developer ID), so on another Mac the first
 open needs right-click → Open. If `npx tauri build` hangs, run
@@ -55,3 +65,6 @@ Requires Rust 1.90+ (sysinfo is pinned to 0.37 for that), Node, Xcode CLT.
 
 Without Full Disk access, macOS hides the program path of processes owned by
 root/other users; those show as "hidden by macOS".
+
+## Licence
+MIT; see [LICENSE](LICENSE).
