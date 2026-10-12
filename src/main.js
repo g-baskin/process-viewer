@@ -358,13 +358,13 @@ async function installHelper() {
     "Stop asking for your password?",
     "macOS will ask for your password one last time. After that, Process Viewer can turn system services on and off straight away. " +
     "It installs a small startup helper that can only switch third-party system services in /Library/LaunchDaemons on or off (never Apple's), " +
-    "and a rule letting your account run just the startup helper. You can undo this here at any time.",
+    "and a rule letting your account run just the startup helper. Any program running as you could then use it too, including to turn off antivirus, VPN or company security services, so leave this off on a work Mac. You can undo this here at any time.",
     "Set it up",
   );
   if (!ok) return;
   try {
     await invoke("install_startup_helper");
-    toast("Done. System startup items now switch without a password.");
+    toast("Done. System services now switch without a password.");
   } catch (e) {
     toast(String(e), true);
   }
@@ -413,7 +413,7 @@ async function toggleMany(items, enable) {
     body,
     enable ? "Turn on" : "Turn off",
     offerHelper
-      ? "Don't ask for my password again. macOS asks once more now to install the startup helper, which can only switch third-party system services (never Apple's). You can undo this at the top of this tab."
+      ? "Don't ask for my password again. macOS asks once more now to install the startup helper, which can only switch third-party system services (never Apple's). Other programs running as you could use it too, including to turn off security software, so leave this off on a work Mac. You can undo this at the top of this tab."
       : null,
   );
   if (!choice) return;

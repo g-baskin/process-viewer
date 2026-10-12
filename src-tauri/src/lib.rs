@@ -371,10 +371,52 @@ fn stop_one(app: &AppHandle, pid: u32, name: &str, mode: &str) -> Result<String,
     }
 }
 
+/// When a process started, as `ps` prints it (e.g. "Mon Oct 12 03:05:11 2026").
+/// None if it has ended. Only letters, digits, colons and single spaces, so
+/// it is safe inside single quotes in a shell command.
+fn start_stamp(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("/bin/ps")
+        .env("LC_ALL", "C")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let stamp = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let safe = !stamp.is_empty()
+        && stamp
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == ' ');
+    safe.then_some(stamp)
+}
+
+/// Root shell that force quits each pid only if it is still the process that
+/// started at `stamp`. A pid freed and reused while the password prompt was
+/// open is left alone.
+fn admin_kill_shell(targets: &[(u32, String)]) -> String {
+    let mut cmds: Vec<String> = targets
+        .iter()
+        .map(|(pid, stamp)| {
+            format!(
+                "LC_ALL=C /bin/ps -o lstart= -p {pid} | /usr/bin/xargs | /usr/bin/grep -qxF '{stamp}' && /bin/kill -9 {pid}"
+            )
+        })
+        .collect();
+    cmds.push("true".into());
+    cmds.join("; ")
+}
+
 /// Force quit checked processes as root with a single password prompt.
-/// pids are numbers, so they are safe to put in the shell command.
-fn kill_as_admin(targets: &[(u32, String)]) -> Result<(), String> {
-    let pids: Vec<String> = targets.iter().map(|(p, _)| p.to_string()).collect();
+/// targets: (pid, name). Returns the pids that are still running afterwards.
+fn kill_as_admin(targets: &[(u32, String)]) -> Result<Vec<u32>, String> {
+    let mut stamped = Vec::new();
+    for (pid, _) in targets {
+        stamped.push((
+            *pid,
+            start_stamp(*pid).ok_or("That process has already ended.")?,
+        ));
+    }
     let prompt = if let [(_, name)] = targets {
         format!("Process Viewer wants to force quit “{name}”.")
     } else {
@@ -383,13 +425,20 @@ fn kill_as_admin(targets: &[(u32, String)]) -> Result<(), String> {
             targets.len()
         )
     };
-    privhelper::run_as_admin(&format!("kill -9 {}", pids.join(" ")), &prompt).map_err(|e| {
+    privhelper::run_as_admin(&admin_kill_shell(&stamped), &prompt).map_err(|e| {
         if e == "Cancelled." {
             e
         } else {
             format!("Couldn't stop them: {e}")
         }
-    })
+    })?;
+    // Give the kernel a moment, then see which of the original processes remain.
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    Ok(stamped
+        .into_iter()
+        .filter(|(pid, stamp)| start_stamp(*pid).as_deref() == Some(stamp.as_str()))
+        .map(|(pid, _)| pid)
+        .collect())
 }
 
 /// mode: "quit" (polite), "force" (SIGKILL), "admin" (SIGKILL via an
@@ -472,12 +521,14 @@ fn terminate_many(
     if !admin.is_empty() {
         let list: Vec<(u32, String)> = admin.iter().map(|(_, p, n)| (*p, n.clone())).collect();
         let r = kill_as_admin(&list);
-        for (i, _, name) in admin {
-            out[i].ok = r.is_ok();
-            out[i].message = match &r {
-                Ok(()) => format!("Force quit “{name}” as administrator."),
-                Err(e) => e.clone(),
+        for (i, pid, name) in admin {
+            let (ok, message) = match &r {
+                Ok(left) if left.contains(&pid) => (false, format!("macOS didn't stop “{name}”.")),
+                Ok(_) => (true, format!("Force quit “{name}” as administrator.")),
+                Err(e) => (false, e.clone()),
             };
+            out[i].ok = ok;
+            out[i].message = message;
         }
     }
     Ok(out)
@@ -581,6 +632,11 @@ fn remove_startup_helper() -> Result<(), String> {
 /// Show a program in Finder.
 #[tauri::command]
 fn reveal(path: String) -> Result<(), String> {
+    // Only full paths: anything else (e.g. starting with "-") could be read
+    // by `open` as an option.
+    if !path.starts_with('/') {
+        return Err("That isn't a full file path.".into());
+    }
     if !std::path::Path::new(&path).exists() {
         return Err("That file no longer exists.".into());
     }
@@ -678,6 +734,44 @@ mod tests {
         // Already reaped: a second signal reports it's gone.
         let err = send_signal(pid, SIGKILL, "sleep").unwrap_err();
         assert!(err.contains("already ended"), "{err}");
+    }
+
+    #[test]
+    fn reveal_refuses_anything_but_full_paths() {
+        assert!(reveal("-a".into()).is_err());
+        assert!(reveal("relative/file".into()).is_err());
+    }
+
+    #[test]
+    fn admin_kill_shell_only_kills_the_same_process() {
+        // Run the generated shell as the normal user against our own child:
+        // a wrong start time leaves it alone, the right one stops it.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let stamp = start_stamp(pid).expect("child has a start time");
+        let shell = admin_kill_shell(&[(pid, "Thu Jan 1 00:00:00 1970".into())]);
+        assert!(!shell.contains('"') && !shell.contains('\\'));
+        let run = |sh: &str| {
+            std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(sh)
+                .status()
+                .unwrap()
+        };
+        assert!(run(&shell).success());
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "wrong start time must not kill"
+        );
+        assert!(run(&admin_kill_shell(&[(pid, stamp)])).success());
+        assert!(
+            !child.wait().unwrap().success(),
+            "matching start time kills it"
+        );
+        assert!(start_stamp(pid).is_none());
     }
 
     #[test]

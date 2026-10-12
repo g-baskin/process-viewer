@@ -110,33 +110,36 @@ pub(crate) fn run_as_admin(shell: &str, prompt: &str) -> Result<(), String> {
     }
 }
 
+/// The root shell that installs the helper and the sudoers rule.
+///
+/// The file contents travel inside the command itself (base64, so no quotes
+/// or backslashes), not through files in the user's temp folder: nothing a
+/// program running as the user can swap while the password prompt is open.
+/// Root decodes them into a fresh root-only folder, visudo checks the rule,
+/// then both are installed.
+fn setup_shell(user: &str) -> String {
+    use base64::Engine;
+    let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+    let (helper, rule) = (b64(SCRIPT), b64(&sudoers_line(user)));
+    format!(
+        "set -e; umask 077; d=$(/usr/bin/mktemp -d /private/tmp/pv-setup.XXXXXX); \
+         trap '/bin/rm -rf $d' EXIT; \
+         echo {helper} | /usr/bin/base64 -D > $d/helper; \
+         echo {rule} | /usr/bin/base64 -D > $d/sudoers; \
+         /usr/sbin/visudo -cf $d/sudoers >/dev/null; \
+         /usr/bin/install -d -o root -g wheel -m 755 /Library/PrivilegedHelperTools; \
+         /usr/bin/install -o root -g wheel -m 755 $d/helper '{HELPER}'; \
+         /usr/bin/install -o root -g wheel -m 440 $d/sudoers '{SUDOERS}'"
+    )
+}
+
 /// Install the helper and the sudoers rule (one password prompt).
 pub fn install() -> Result<(), String> {
     let user = username()?;
-    let dir = std::env::temp_dir().join(format!("process-viewer-setup-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
-    let helper_tmp = dir.join("helper");
-    let sudoers_tmp = dir.join("sudoers");
-    std::fs::write(&helper_tmp, SCRIPT).map_err(|e| e.to_string())?;
-    std::fs::write(&sudoers_tmp, sudoers_line(&user)).map_err(|e| e.to_string())?;
-    let (h, s) = (helper_tmp.to_string_lossy(), sudoers_tmp.to_string_lossy());
-    if [h.as_ref(), s.as_ref()].iter().any(|p| p.contains('\'')) {
-        return Err("The temporary folder has an unusual name.".into());
-    }
-    // visudo checks the rule first, so a broken file can never reach sudoers.d.
-    let shell = format!(
-        "set -e; /usr/sbin/visudo -cf '{s}' >/dev/null; \
-         /usr/bin/install -d -o root -g wheel -m 755 /Library/PrivilegedHelperTools; \
-         /usr/bin/install -o root -g wheel -m 755 '{h}' '{HELPER}'; \
-         /usr/bin/install -o root -g wheel -m 440 '{s}' '{SUDOERS}'"
-    );
-    let r = run_as_admin(
-        &shell,
+    run_as_admin(
+        &setup_shell(&user),
         "Process Viewer wants to turn system services on and off without asking for your password each time. You only need to do this once.",
-    );
-    let _ = std::fs::remove_dir_all(&dir);
-    r?;
+    )?;
     if !ready() {
         return Err("Setup finished but sudo still asks for a password. Check that /etc/sudoers includes /etc/sudoers.d.".into());
     }
@@ -234,6 +237,35 @@ mod tests {
         let p = entry.path();
         let (code, err) = sh(&["disable", "not.the.right.label", p.to_str().unwrap()]);
         assert_eq!(code, 2, "{err}");
+    }
+
+    #[test]
+    fn setup_carries_the_files_inline_and_decodes_them_exactly() {
+        let shell = setup_shell("someone");
+        // run_as_admin refuses these, and nothing may point at the user's temp folder.
+        assert!(!shell.contains('"') && !shell.contains('\\'), "{shell}");
+        let tmp = std::env::temp_dir().to_string_lossy().into_owned();
+        assert!(!shell.contains(tmp.trim_end_matches('/')), "{shell}");
+        // Run just the decode steps (no install) as the normal user.
+        let decode: Vec<&str> = shell
+            .split("; ")
+            .filter(|c| c.contains("base64 -D"))
+            .collect();
+        assert_eq!(decode.len(), 2);
+        let dir = std::env::temp_dir().join(format!("pv-setup-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = format!("d={}; {}", dir.display(), decode.join("; "));
+        let ok = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .status()
+            .unwrap();
+        assert!(ok.success());
+        let helper = std::fs::read_to_string(dir.join("helper")).unwrap();
+        let rule = std::fs::read_to_string(dir.join("sudoers")).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(helper, SCRIPT);
+        assert_eq!(rule, sudoers_line("someone"));
     }
 
     #[test]

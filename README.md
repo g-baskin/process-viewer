@@ -19,8 +19,10 @@ what each process is, which program is running it, and lets you stop it.
   (/Library/PrivilegedHelperTools/com.dellcbyer.processviewer.startup-helper)
   plus a sudoers rule (/etc/sudoers.d/process-viewer) allowing only that helper.
   The startup helper only switches third-party plists in /Library/LaunchDaemons
-  whose Label matches. "Turn this off" removes both. Why: see
-  [docs/adr/0001](docs/adr/0001-startup-helper-with-sudoers-rule.md).
+  whose Label matches. "Turn this off" removes both. Any program running as
+  you can use the helper too (including to turn off security software), so
+  leave it off on a work Mac. Why: see
+  [docs/adr/0002](docs/adr/0002-startup-helper-trusts-every-program-running-as-you.md).
 
 Every list lets you pick several rows: ⌘-click adds or removes one, ⇧-click
 or ⇧-arrow picks a range, ⌘A picks all, Esc goes back to one. Several
