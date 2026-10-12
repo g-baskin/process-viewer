@@ -22,6 +22,12 @@ what each process is, which program is running it, and lets you stop it.
   whose Label matches. "Turn this off" removes both. Why: see
   [docs/adr/0001](docs/adr/0001-startup-helper-with-sudoers-rule.md).
 
+Every list lets you pick several rows: ⌘-click adds or removes one, ⇧-click
+or ⇧-arrow picks a range, ⌘A picks all, Esc goes back to one. Several
+processes can then be quit or force quit together (one password prompt for
+"as admin"), and several startup items turned on or off together (one
+password prompt for all the system services, or none with the startup helper).
+
 Terms used in code, UI and docs are defined in [CONTEXT.md](CONTEXT.md).
 
 The detail pane shows live CPU and memory graphs (last 3 minutes, app +
@@ -55,6 +61,7 @@ npm run build    # makes src-tauri/target/release/bundle/macos/Process Viewer.ap
 ## Test
 ```sh
 cd src-tauri && cargo test
+npm test   # front-end selection logic
 ```
 
 The app is ad-hoc signed (no Apple Developer ID), so on another Mac the first

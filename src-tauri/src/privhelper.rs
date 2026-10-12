@@ -81,12 +81,15 @@ pub fn ready() -> bool {
         .unwrap_or(false)
 }
 
-fn run_as_admin(shell: &str, prompt: &str) -> Result<(), String> {
-    // `shell` only contains fixed paths and paths we created and checked, all
-    // free of quotes, so it is safe inside the AppleScript string.
+/// Run a shell command as root after one macOS password prompt.
+/// `shell` must only contain fixed paths, checked labels and numbers: it is
+/// rejected if it holds anything that could break out of the AppleScript
+/// string. The prompt is display text, so such characters are just removed.
+pub(crate) fn run_as_admin(shell: &str, prompt: &str) -> Result<(), String> {
     if shell.contains('"') || shell.contains('\\') {
-        return Err("Unexpected characters in the setup command.".into());
+        return Err("Unexpected characters in the command.".into());
     }
+    let prompt = prompt.replace(['"', '\\'], "");
     let script = format!(
         "do shell script \"{shell}\" with administrator privileges with prompt \"{prompt}\""
     );

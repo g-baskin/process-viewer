@@ -324,16 +324,9 @@ fn build_snapshot(state: &AppState, apps: Vec<RunningApp>) -> Result<Snapshot, S
     })
 }
 
-/// mode: "quit" (polite), "force" (SIGKILL), "admin" (SIGKILL via an
-/// administrator password prompt, for processes owned by root).
-#[tauri::command(async)]
-fn terminate(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    pid: u32,
-    start_time: u64,
-    mode: String,
-) -> Result<String, String> {
+/// Check that `pid` is still the process the user picked and may be stopped.
+/// Returns its name.
+fn check_target(state: &AppState, pid: u32, start_time: u64) -> Result<String, String> {
     let name = {
         let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
         let target = Pid::from_u32(pid);
@@ -353,10 +346,14 @@ fn terminate(
     if pid == std::process::id() {
         return Err("That's this app. Close the window to quit it.".into());
     }
+    Ok(name)
+}
 
-    match mode.as_str() {
+/// Stop one checked process without a password ("quit" or "force").
+fn stop_one(app: &AppHandle, pid: u32, name: &str, mode: &str) -> Result<String, String> {
+    match mode {
         "quit" => {
-            if let Some(ok) = on_main(&app, move || macos::quit_app(pid, false))? {
+            if let Some(ok) = on_main(app, move || macos::quit_app(pid, false))? {
                 return if ok {
                     Ok(format!(
                         "Asked “{name}” to quit. It may ask you to save your work first."
@@ -367,33 +364,123 @@ fn terminate(
                     ))
                 };
             }
-            send_signal(pid, SIGTERM, &name).map(|_| format!("Sent “{name}” a request to stop."))
+            send_signal(pid, SIGTERM, name).map(|_| format!("Sent “{name}” a request to stop."))
         }
-        "force" => send_signal(pid, SIGKILL, &name).map(|_| format!("Force quit “{name}”.")),
-        "admin" => {
-            // pid is a number, so it is safe to put in the script.
-            let script = format!(
-                "do shell script \"kill -9 {pid}\" with administrator privileges with prompt \"Process Viewer wants to force quit “{}”.\"",
-                name.replace(['"', '\\'], "")
-            );
-            let out = std::process::Command::new("/usr/bin/osascript")
-                .arg("-e")
-                .arg(script)
-                .output()
-                .map_err(|e| e.to_string())?;
-            if out.status.success() {
-                Ok(format!("Force quit “{name}” as administrator."))
-            } else {
-                let err = String::from_utf8_lossy(&out.stderr);
-                if err.contains("-128") {
-                    Err("Cancelled.".into())
-                } else {
-                    Err(format!("Couldn't stop “{name}”: {}", err.trim()))
-                }
-            }
-        }
+        "force" => send_signal(pid, SIGKILL, name).map(|_| format!("Force quit “{name}”.")),
         _ => Err("Unknown action.".into()),
     }
+}
+
+/// Force quit checked processes as root with a single password prompt.
+/// pids are numbers, so they are safe to put in the shell command.
+fn kill_as_admin(targets: &[(u32, String)]) -> Result<(), String> {
+    let pids: Vec<String> = targets.iter().map(|(p, _)| p.to_string()).collect();
+    let prompt = if let [(_, name)] = targets {
+        format!("Process Viewer wants to force quit “{name}”.")
+    } else {
+        format!(
+            "Process Viewer wants to force quit {} processes.",
+            targets.len()
+        )
+    };
+    privhelper::run_as_admin(&format!("kill -9 {}", pids.join(" ")), &prompt).map_err(|e| {
+        if e == "Cancelled." {
+            e
+        } else {
+            format!("Couldn't stop them: {e}")
+        }
+    })
+}
+
+/// mode: "quit" (polite), "force" (SIGKILL), "admin" (SIGKILL via an
+/// administrator password prompt, for processes owned by root).
+#[tauri::command(async)]
+fn terminate(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    pid: u32,
+    start_time: u64,
+    mode: String,
+) -> Result<String, String> {
+    let out = terminate_many(app, state, vec![Target { pid, start_time }], mode)?;
+    let o = out.into_iter().next().ok_or("Nothing was stopped.")?;
+    if o.ok {
+        Ok(o.message)
+    } else {
+        Err(o.message)
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Target {
+    pid: u32,
+    start_time: u64,
+}
+
+#[derive(Serialize)]
+struct StopOutcome {
+    pid: u32,
+    ok: bool,
+    message: String,
+}
+
+/// Stop several processes. Each one is checked again (still the same
+/// process, not protected, not this app). "admin" asks for the password once
+/// for all of them. Returns one outcome per target, in the order given.
+#[tauri::command(async)]
+fn terminate_many(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    targets: Vec<Target>,
+    mode: String,
+) -> Result<Vec<StopOutcome>, String> {
+    if !matches!(mode.as_str(), "quit" | "force" | "admin") {
+        return Err("Unknown action.".into());
+    }
+    if targets.len() > 500 {
+        return Err("Too many processes at once.".into());
+    }
+    let mut out = Vec::with_capacity(targets.len());
+    let mut admin: Vec<(usize, u32, String)> = Vec::new();
+    for t in &targets {
+        let checked = check_target(&state, t.pid, t.start_time);
+        match (checked, mode.as_str()) {
+            (Err(message), _) => out.push(StopOutcome {
+                pid: t.pid,
+                ok: false,
+                message,
+            }),
+            (Ok(name), "admin") => {
+                admin.push((out.len(), t.pid, name));
+                out.push(StopOutcome {
+                    pid: t.pid,
+                    ok: false,
+                    message: String::new(),
+                });
+            }
+            (Ok(name), m) => {
+                let r = stop_one(&app, t.pid, &name, m);
+                out.push(StopOutcome {
+                    pid: t.pid,
+                    ok: r.is_ok(),
+                    message: r.unwrap_or_else(|e| e),
+                });
+            }
+        }
+    }
+    if !admin.is_empty() {
+        let list: Vec<(u32, String)> = admin.iter().map(|(_, p, n)| (*p, n.clone())).collect();
+        let r = kill_as_admin(&list);
+        for (i, _, name) in admin {
+            out[i].ok = r.is_ok();
+            out[i].message = match &r {
+                Ok(()) => format!("Force quit “{name}” as administrator."),
+                Err(e) => e.clone(),
+            };
+        }
+    }
+    Ok(out)
 }
 
 fn send_signal(pid: u32, sig: i32, name: &str) -> Result<(), String> {
@@ -463,6 +550,15 @@ fn startup_items(state: State<'_, AppState>) -> Result<Vec<startup::StartupItem>
 #[tauri::command(async)]
 fn set_startup(label: String, enable: bool) -> Result<String, String> {
     startup::set_enabled(&label, enable)
+}
+
+/// Turn several startup items on or off; system services share one prompt.
+#[tauri::command(async)]
+fn set_startup_many(labels: Vec<String>, enable: bool) -> Result<Vec<startup::Outcome>, String> {
+    if labels.len() > 500 {
+        return Err("Too many items at once.".into());
+    }
+    Ok(startup::set_many(&labels, enable))
 }
 
 /// Is password-free switching of system startup items set up?
@@ -555,6 +651,8 @@ pub fn run() {
             search_web,
             startup_items,
             set_startup,
+            set_startup_many,
+            terminate_many,
             startup_helper_ready,
             install_startup_helper,
             remove_startup_helper

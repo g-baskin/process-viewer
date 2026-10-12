@@ -10,8 +10,10 @@ const state = {
   sort: { key: "cpu", asc: false },
   snap: null,
   byPid: new Map(),
-  selected: null,       // pid
-  selectedStart: null,  // start_time, to detect pid reuse
+  selected: null,       // pid with focus (shown in the detail pane)
+  selectedStart: null,  // its start_time, to detect pid reuse
+  pick: MultiSelect.empty(),   // processes picked with ⌘/⇧-click (keys: pid)
+  pickStart: new Map(),        // pid -> start_time when picked
   expanded: new Set(),  // app pids / tree pids that are open
   treeCollapsed: new Set(),
   icons: new Map(),     // path -> data url | null | Promise
@@ -21,7 +23,9 @@ const state = {
   totalCpu: [],
   startup: null,        // list of startup items
   startupAt: 0,
-  selectedStartup: null, // label
+  selectedStartup: null, // plist path of the item with focus
+  startupPick: MultiSelect.empty(), // startup items picked (keys: plist path,
+                                    // since one label can be in two folders)
   helperReady: null,     // password-free switching set up?
 };
 const HIST = 90; // samples kept (3 minutes at one every 2 s)
@@ -33,6 +37,48 @@ const el = (tag, cls, text) => {
   if (text != null) e.textContent = text;
   return e;
 };
+
+const plural = (n, one, many = one + "s") => `${n} ${n === 1 ? one : many}`;
+
+// ---------- selection ----------
+// Every list supports picking several rows: ⌘-click adds or removes one,
+// ⇧-click (or ⇧-arrow) picks a range, ⌘A picks all, Esc goes back to one.
+function setPick(sel) {
+  state.pick = sel;
+  for (const k of [...state.pickStart.keys()]) if (!sel.keys.has(k)) state.pickStart.delete(k);
+  for (const k of sel.keys) {
+    const p = state.byPid.get(k);
+    if (!state.pickStart.has(k) && p) state.pickStart.set(k, p.start_time);
+  }
+  state.selected = sel.focus;
+  state.selectedStart = sel.focus != null ? (state.pickStart.get(sel.focus) ?? null) : null;
+}
+function setStartupPick(sel) {
+  state.startupPick = sel;
+  state.selectedStartup = sel.focus;
+}
+/** Processes picked that are still the same running process. */
+function pickedProcs() {
+  return [...state.pick.keys]
+    .map((pid) => state.byPid.get(pid))
+    .filter((p) => p && p.start_time === state.pickStart.get(p.pid));
+}
+function pickedStartup() {
+  return (state.startup || []).filter((i) => state.startupPick.keys.has(i.plist));
+}
+function pickCount() {
+  return state.view === "startup" ? state.startupPick.keys.size : state.pick.keys.size;
+}
+/** Apply a click or arrow key to the current view's selection, then show it. */
+function applyPick(next) {
+  if (state.view === "startup") setStartupPick(next(state.startupPick));
+  else setPick(next(state.pick));
+  render();
+  const focus = state.view === "startup" ? state.selectedStartup : state.selected;
+  if (focus == null) return;
+  const sel = state.view === "startup" ? `.row[data-plist="${CSS.escape(String(focus))}"]` : `.row[data-pid="${focus}"]`;
+  document.querySelector(sel)?.scrollIntoView({ block: "nearest" });
+}
 
 // ---------- formatting ----------
 function fmtMem(b) {
@@ -65,6 +111,11 @@ async function refresh() {
     const snap = await invoke("snapshot");
     state.snap = snap;
     state.byPid = new Map(snap.procs.map((p) => [p.pid, p]));
+    // With several picked, drop the ones that have ended. (A single pick
+    // stays, so the detail pane can say "That process has ended".)
+    if (state.pick.keys.size > 1) {
+      setPick(MultiSelect.prune(state.pick, (pid) => state.byPid.get(pid)?.start_time === state.pickStart.get(pid)));
+    }
     recordHistory(snap);
     if (state.view === "startup" && Date.now() - state.startupAt > 10000) await loadStartup();
     render();
@@ -154,6 +205,10 @@ async function loadStartup() {
   try {
     const [items, ready] = await Promise.all([invoke("startup_items"), invoke("startup_helper_ready")]);
     state.startup = items;
+    if (state.startupPick.keys.size > 1) {
+      const plists = new Set(items.map((i) => i.plist));
+      setStartupPick(MultiSelect.prune(state.startupPick, (k) => plists.has(k)));
+    }
     state.helperReady = ready;
     state.startupAt = Date.now();
   } catch (e) {
@@ -198,8 +253,8 @@ function renderStartup(frag, q) {
     frag.append(el("div", "section-head", `${SCOPE_TITLE[scope]} (${list.length})`));
     for (const i of list) {
       const r = el("div", "row startup");
-      r.dataset.label = i.label;
-      if (i.label === state.selectedStartup) r.classList.add("selected");
+      r.dataset.plist = i.plist;
+      if (state.startupPick.keys.has(i.plist)) r.classList.add("selected");
       const name = el("div", "name");
       const bundle = i.program && i.program.includes(".app/") ? i.program.slice(0, i.program.indexOf(".app/") + 4) : null;
       name.append(iconNode(bundle));
@@ -213,7 +268,7 @@ function renderStartup(frag, q) {
         ? el("span", "chip run", i.enabled ? "On · running" : "Off · running")
         : el("span", "chip " + (i.enabled ? "on" : "off"), i.enabled ? "On" : "Off");
       r.append(name, when, chip);
-      state.rows.push(i.label);
+      state.rows.push(i.plist);
       frag.append(r);
     }
   }
@@ -221,9 +276,10 @@ function renderStartup(frag, q) {
 }
 
 function renderStartupDetail(pane) {
-  const i = state.startup && state.startup.find((x) => x.label === state.selectedStartup);
+  if (state.startupPick.keys.size > 1) { renderStartupMultiDetail(pane); return; }
+  const i = state.startup && state.startup.find((x) => x.plist === state.selectedStartup);
   if (!i) {
-    pane.replaceChildren(el("div", "empty", "Select a startup item to see what it runs and to turn it on or off."));
+    pane.replaceChildren(el("div", "empty", "Select a startup item to see what it runs and to turn it on or off. ⌘-click or ⇧-click to pick several."));
     return;
   }
   const out = document.createDocumentFragment();
@@ -334,15 +390,27 @@ async function removeHelper() {
 }
 
 async function toggleStartup(i) {
-  const enable = !i.enabled;
+  return toggleMany([i], !i.enabled);
+}
+
+/** Turn startup items on or off: one confirmation, one password prompt. */
+async function toggleMany(items, enable) {
+  if (!items.length) return;
+  const one = items.length === 1 ? items[0] : null;
   // System services need root. Until the startup helper is set up, offer it
   // right here so this is the last time macOS asks for the password.
-  const offerHelper = i.scope === "system-service" && !state.helperReady;
-  const choice = await confirmDialog(
-    enable ? `Turn on “${i.label}”?` : `Turn off “${i.label}”?`,
-    enable
+  const offerHelper = items.some((i) => i.scope === "system-service") && !state.helperReady;
+  const what = one ? `“${one.label}”` : plural(items.length, "startup item");
+  const body = one
+    ? (enable
       ? "It will start now and every time it's meant to."
-      : "It will stop now and won't start automatically any more. You can turn it back on here.",
+      : "It will stop now and won't start automatically any more. You can turn it back on here.")
+    : `${namesText(items.map((i) => i.label))}. ` + (enable
+      ? "They will start now and every time they're meant to."
+      : "They will stop now and won't start automatically any more. You can turn them back on here.");
+  const choice = await confirmDialog(
+    enable ? `Turn on ${what}?` : `Turn off ${what}?`,
+    body,
     enable ? "Turn on" : "Turn off",
     offerHelper
       ? "Don't ask for my password again. macOS asks once more now to install the startup helper, which can only switch third-party system services (never Apple's). You can undo this at the top of this tab."
@@ -361,12 +429,52 @@ async function toggleStartup(i) {
     }
   }
   try {
-    toast(await invoke("set_startup", { label: i.label, enable }));
+    if (one) {
+      toast(await invoke("set_startup", { label: one.label, enable }));
+    } else {
+      const labels = [...new Set(items.map((i) => i.label))];
+      const out = await invoke("set_startup_many", { labels, enable });
+      reportMany(out, (n) => `Turned ${enable ? "on" : "off"} ${plural(n, "startup item")}.`);
+    }
   } catch (e) {
     toast(String(e), true);
   }
   await loadStartup();
   await refresh();
+}
+
+function renderStartupMultiDetail(pane) {
+  const items = pickedStartup();
+  const on = items.filter((i) => i.enabled);
+  const off = items.filter((i) => !i.enabled);
+  const out = document.createDocumentFragment();
+  const t = el("div", "d-head");
+  const h = el("div");
+  h.append(el("div", "d-title", `${plural(items.length, "startup item")} selected`));
+  h.append(el("div", "d-sub", `${on.length} on · ${off.length} off`));
+  t.append(h);
+  out.append(t, namesList(items.map((i) => i.label)));
+  out.append(el("div", "d-section", "Turn them on or off"));
+  const actions = el("div", "actions");
+  if (on.length) {
+    const b = el("button", "btn danger", `Turn off ${on.length}`);
+    b.onclick = () => toggleMany(on, false);
+    actions.append(b);
+  }
+  if (off.length) {
+    const b = el("button", "btn", `Turn on ${off.length}`);
+    b.onclick = () => toggleMany(off, true);
+    actions.append(b);
+  }
+  out.append(actions);
+  if (items.some((i) => i.scope === "system-service")) {
+    out.append(el("div", "note", (state.helperReady
+      ? "No password needed (set up at the top of this tab). "
+      : "macOS will ask for your password once for all the system services. ") +
+      "Be careful with security, VPN and company-managed software: turning those off can break things or go against your workplace's rules."));
+  }
+  out.append(el("div", "note", "⌘-click to add or remove an item, ⇧-click for a range, Esc to go back to one."));
+  pane.replaceChildren(out);
 }
 
 /**
@@ -500,7 +608,7 @@ function render() {
 function row(p, opts = {}) {
   const r = el("div", "row" + (opts.cls ? " " + opts.cls : ""));
   r.dataset.pid = p.pid;
-  if (p.pid === state.selected) r.classList.add("selected");
+  if (state.pick.keys.has(p.pid)) r.classList.add("selected");
   const name = el("div", "name");
   if (opts.indent) name.style.paddingLeft = opts.indent + "px";
   if (opts.disclosure !== undefined) {
@@ -645,18 +753,20 @@ function renderStatus() {
   const st = $("#status");
   st.textContent =
     `${s.procs.length} processes · ${apps} apps open · Memory used by processes ${fmtMem(mem)} of ${fmtMem(s.total_memory)} · CPU ${cpu.toFixed(0)}%`;
+  if (pickCount() > 1) st.append(` · ${pickCount()} selected`);
   st.append(sparkline(state.totalCpu, 100, "status-cpu"));
 }
 
 function renderDetail() {
   const pane = $("#detail");
   if (state.view === "startup") { delete pane.dataset.pid; renderStartupDetail(pane); return; }
+  if (state.pick.keys.size > 1) { delete pane.dataset.pid; renderMultiDetail(pane); return; }
   const p = state.selected != null ? state.byPid.get(state.selected) : null;
   if (!p || (state.selectedStart != null && p.start_time !== state.selectedStart)) {
     if (state.selected != null && !p) {
       pane.replaceChildren(el("div", "empty", "That process has ended."));
     } else if (state.selected == null) {
-      pane.replaceChildren(el("div", "empty", "Select a process to see what it is, what started it, and to stop it."));
+      pane.replaceChildren(el("div", "empty", "Select a process to see what it is, what started it, and to stop it. ⌘-click or ⇧-click to pick several."));
     } else {
       pane.replaceChildren(el("div", "empty", "That process has ended."));
     }
@@ -805,8 +915,7 @@ function pidLink(pid, name) {
 
 function select(pid, reveal) {
   const p = state.byPid.get(pid);
-  state.selected = pid;
-  state.selectedStart = p ? p.start_time : null;
+  setPick(MultiSelect.click(state.pick, state.rows, pid));
   if (reveal && p) {
     // Make sure it's visible: open its app group / show system.
     if (p.app_pid != null && p.app_pid !== pid) state.expanded.add(p.app_pid);
@@ -843,6 +952,117 @@ async function stop(p, mode) {
   try {
     const msg = await invoke("terminate", { pid: p.pid, startTime: p.start_time, mode });
     toast(msg);
+  } catch (e) {
+    toast(String(e), true);
+  }
+  setTimeout(refresh, 400);
+  setTimeout(refresh, 1500);
+}
+
+const nameOf = (p) => (p.kind === "app" || p.kind === "menubar") ? (p.app_name || p.name) : p.name;
+
+function namesText(names) {
+  const shown = names.slice(0, 5).join(", ");
+  return names.length > 5 ? `${shown} and ${names.length - 5} more` : shown;
+}
+
+function namesList(names) {
+  const ul = el("ul", "pick-list");
+  for (const n of names.slice(0, 10)) ul.append(el("li", null, n));
+  if (names.length > 10) ul.append(el("li", "muted", `and ${names.length - 10} more`));
+  return ul;
+}
+
+/** Toast a summary of a batch result: [{ ok, message }]. */
+function reportMany(outcomes, doneText) {
+  const failed = outcomes.filter((o) => !o.ok);
+  const ok = outcomes.length - failed.length;
+  if (!failed.length) { toast(doneText(ok)); return; }
+  if (failed.every((o) => o.message === "Cancelled.")) { toast("Cancelled.", true); return; }
+  const lead = ok ? doneText(ok) + " " : "";
+  toast(`${lead}${plural(failed.length, "item")} didn't work: ${failed[0].message}`, true);
+}
+
+function renderMultiDetail(pane) {
+  const ps = pickedProcs();
+  const out = document.createDocumentFragment();
+  const head = el("div", "d-head");
+  const h = el("div");
+  h.append(el("div", "d-title", `${plural(ps.length, "process", "processes")} selected`));
+  // Count apps with their helpers, as the rows do, without counting any
+  // process twice.
+  const counted = new Set(ps.map((p) => p.pid));
+  for (const p of ps) {
+    if (p.kind !== "app" && p.kind !== "menubar") continue;
+    for (const x of state.snap.procs) if (x.app_pid === p.pid) counted.add(x.pid);
+  }
+  let cpu = 0;
+  let mem = 0;
+  for (const pid of counted) {
+    const x = state.byPid.get(pid);
+    if (x) { cpu += x.cpu; mem += x.memory; }
+  }
+  h.append(el("div", "d-sub", `${fmtCpu(cpu)} CPU · ${fmtMem(mem)} together (apps include their helpers)`));
+  head.append(h);
+  out.append(head, namesList(ps.map(nameOf)));
+
+  out.append(el("div", "d-section", "Stop them"));
+  const self = state.snap.self_pid;
+  const stoppable = ps.filter((p) => !p.protected && p.pid !== self);
+  const skipped = ps.length - stoppable.length;
+  if (skipped) {
+    out.append(el("div", "note warn-note",
+      `${plural(skipped, "of these is", "of these are")} core macOS or this app, so ${skipped === 1 ? "it" : "they"} will be left alone.`));
+  }
+  if (stoppable.length) {
+    const actions = el("div", "actions");
+    const quit = el("button", "btn danger", `Quit / end ${stoppable.length}`);
+    quit.onclick = () => stopMany(stoppable, "quit");
+    const force = el("button", "btn danger-outline", `Force quit ${stoppable.length}`);
+    force.onclick = () => stopMany(stoppable, "force");
+    actions.append(quit, force);
+    const me = state.byPid.get(self)?.user;
+    if (stoppable.some((p) => !p.user || p.user !== me)) {
+      const admin = el("button", "btn", "Force quit as admin…");
+      admin.onclick = () => stopMany(stoppable, "admin");
+      actions.append(admin);
+    }
+    out.append(actions);
+    out.append(el("div", "note",
+      "Quit asks apps to close normally, so they can offer to save your work. Force quit stops everything straight away; unsaved work is lost. As admin asks for your password once for all of them."));
+  }
+  out.append(el("div", "note", "⌘-click to add or remove a process, ⇧-click for a range, Esc to go back to one."));
+  pane.replaceChildren(out);
+}
+
+async function stopMany(ps, mode) {
+  // Helpers of a picked app close with it when it quits, so leave them out.
+  const picked = new Set(ps.map((p) => p.pid));
+  const targets = mode === "quit"
+    ? ps.filter((p) => !(p.kind === "helper" && p.app_pid != null && picked.has(p.app_pid)))
+    : ps;
+  if (!targets.length) return;
+  const n = plural(targets.length, "process", "processes");
+  const titles = {
+    quit: `Quit or end ${n}?`,
+    force: `Force quit ${n}?`,
+    admin: `Force quit ${n} as administrator?`,
+  };
+  const body = {
+    quit: "Apps will close normally and may ask you to save your work; other processes will be asked to stop.",
+    force: "They will be stopped immediately. Any unsaved work in them will be lost.",
+    admin: "macOS will ask for your password once. They will be stopped immediately.",
+  }[mode];
+  const sys = targets.some((p) => p.kind === "system") ? " Some are part of macOS — only do this if you know why." : "";
+  const ok = await confirmDialog(titles[mode], `${namesText(targets.map(nameOf))}. ${body}${sys}`,
+    mode === "quit" ? "Quit / end" : "Force quit");
+  if (!ok) return;
+  try {
+    const out = await invoke("terminate_many", {
+      targets: targets.map((p) => ({ pid: p.pid, startTime: p.start_time })),
+      mode,
+    });
+    reportMany(out, (k) => mode === "quit" ? `Asked ${plural(k, "process", "processes")} to stop.` : `Force quit ${plural(k, "process", "processes")}.`);
   } catch (e) {
     toast(String(e), true);
   }
@@ -896,8 +1116,10 @@ $("#list").addEventListener("click", (e) => {
     render();
     return;
   }
-  if (r && r.dataset.label) { state.selectedStartup = r.dataset.label; render(); return; }
-  if (r) select(Number(r.dataset.pid));
+  if (!r || (!r.dataset.plist && !r.dataset.pid)) return;
+  const key = r.dataset.plist ?? Number(r.dataset.pid);
+  const mods = { toggle: e.metaKey, extend: e.shiftKey };
+  applyPick((sel) => MultiSelect.click(sel, state.rows, key, mods));
 });
 $("#list").addEventListener("dblclick", (e) => {
   const r = e.target.closest(".row.group");
@@ -910,30 +1132,31 @@ document.addEventListener("keydown", (e) => {
   if ((e.metaKey && e.key === "f")) { e.preventDefault(); $("#search").focus(); return; }
   if ((e.metaKey && e.key === "r")) { e.preventDefault(); refresh(); return; }
   if ($("#confirm").open || e.target === $("#search")) return;
-  if (state.view === "startup") {
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-      e.preventDefault();
-      const j = state.rows.indexOf(state.selectedStartup);
-      const n = state.rows[Math.max(0, Math.min(state.rows.length - 1, j + (e.key === "ArrowDown" ? 1 : -1)))];
-      if (n != null) {
-        state.selectedStartup = n;
-        render();
-        document.querySelector(`.row[data-label="${CSS.escape(n)}"]`)?.scrollIntoView({ block: "nearest" });
-      }
-    }
-    return;
-  }
-  const i = state.rows.indexOf(state.selected);
   if (e.key === "ArrowDown" || e.key === "ArrowUp") {
     e.preventDefault();
-    const n = state.rows[Math.max(0, Math.min(state.rows.length - 1, i + (e.key === "ArrowDown" ? 1 : -1)))];
-    if (n != null) select(n);
-  } else if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && state.selected != null) {
+    const delta = e.key === "ArrowDown" ? 1 : -1;
+    applyPick((sel) => MultiSelect.step(sel, state.rows, delta, e.shiftKey));
+    return;
+  }
+  if (e.metaKey && e.key === "a") {
+    e.preventDefault();
+    applyPick(() => MultiSelect.all(state.rows));
+    return;
+  }
+  if (e.key === "Escape" && pickCount() > 1) {
+    applyPick((sel) => sel.focus != null ? MultiSelect.click(sel, state.rows, sel.focus) : MultiSelect.empty());
+    return;
+  }
+  if (state.view === "startup") return;
+  if ((e.key === "ArrowRight" || e.key === "ArrowLeft") && state.selected != null) {
     const set = state.view === "tree" ? state.treeCollapsed : state.expanded;
     const open = e.key === "ArrowRight";
     if (state.view === "tree") open ? set.delete(state.selected) : set.add(state.selected);
     else open ? set.add(state.selected) : set.delete(state.selected);
     render();
+  } else if ((e.key === "Backspace" || e.key === "Delete") && e.metaKey && state.pick.keys.size > 1) {
+    const ps = pickedProcs().filter((p) => !p.protected && p.pid !== state.snap.self_pid);
+    if (ps.length) stopMany(ps, "quit");
   } else if ((e.key === "Backspace" || e.key === "Delete") && e.metaKey && state.selected != null) {
     const p = state.byPid.get(state.selected);
     if (p && !p.protected) stop(p, "quit");

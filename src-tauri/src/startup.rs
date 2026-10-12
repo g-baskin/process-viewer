@@ -252,87 +252,245 @@ fn safe_label(label: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
 }
 
-/// Turn a startup item on or off. Looks the item up again by label so only
-/// items this app listed can be touched.
-pub fn set_enabled(label: &str, enable: bool) -> Result<String, String> {
-    if !safe_label(label) {
-        return Err("This item has an unusual name, so it can't be changed from here. Use “Show in Finder” instead.".into());
-    }
-    let item = list(&[])
-        .into_iter()
-        .find(|i| i.label == label)
-        .ok_or("That startup item no longer exists.")?;
-    let plist_path = item.plist.clone();
+/// The result of switching one startup item.
+#[derive(Serialize, Clone)]
+pub struct Outcome {
+    pub label: String,
+    pub ok: bool,
+    pub message: String,
+}
 
-    if item.scope == "system-service" && crate::privhelper::ready() {
-        crate::privhelper::toggle(label, &plist_path, enable)?;
-    } else if item.scope == "system-service" {
-        // Needs root: ask macOS for the admin password. The label was checked
-        // above; the plist path comes from our own listing of /Library/LaunchDaemons.
-        let quoted = plist_path.replace('\'', "");
-        let shell = if enable {
-            format!("launchctl enable system/{label}; launchctl bootstrap system '{quoted}' 2>/dev/null; true")
-        } else {
-            format!("launchctl disable system/{label}; launchctl bootout system/{label} 2>/dev/null; true")
-        };
-        let verb = if enable { "turn on" } else { "turn off" };
-        let script = format!(
-            "do shell script \"{shell}\" with administrator privileges with prompt \"Process Viewer wants to {verb} the startup item “{label}”.\""
-        );
-        let out = Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(script)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(if err.contains("-128") {
-                "Cancelled.".into()
-            } else {
-                err.trim().to_string()
-            });
+impl Outcome {
+    fn done(label: &str, message: String) -> Self {
+        Outcome {
+            label: label.into(),
+            ok: true,
+            message,
         }
-    } else {
-        let domain = format!("gui/{}", uid());
-        let target = format!("{domain}/{label}");
-        let first = Command::new("/bin/launchctl")
-            .args([if enable { "enable" } else { "disable" }, &target])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if !first.status.success() {
-            return Err(format!(
-                "macOS refused: {}",
-                String::from_utf8_lossy(&first.stderr).trim()
-            ));
-        }
-        // Load or unload it now too; it's fine if it was already in that state.
-        let _ = if enable {
-            Command::new("/bin/launchctl")
-                .args(["bootstrap", &domain, &plist_path])
-                .output()
-        } else {
-            Command::new("/bin/launchctl")
-                .args(["bootout", &target])
-                .output()
-        };
     }
-    Ok(if enable {
-        format!(
-            "Turned on “{label}”. It will start {}.",
-            if item.scope == "system-service" {
-                "at startup"
-            } else {
-                "at login"
-            }
-        )
+    fn failed(label: &str, message: impl Into<String>) -> Self {
+        Outcome {
+            label: label.into(),
+            ok: false,
+            message: message.into(),
+        }
+    }
+}
+
+fn done_text(label: &str, scope: &str, enable: bool) -> String {
+    if enable {
+        let at = if scope == "system-service" {
+            "at startup"
+        } else {
+            "at login"
+        };
+        format!("Turned on “{label}”. It will start {at}.")
     } else {
         format!("Turned off “{label}”. It won't start automatically any more (you can turn it back on here).")
+    }
+}
+
+/// Turn one startup item on or off.
+pub fn set_enabled(label: &str, enable: bool) -> Result<String, String> {
+    let out = set_many(&[label.to_string()], enable)
+        .pop()
+        .ok_or("Nothing was changed.")?;
+    if out.ok {
+        Ok(out.message)
+    } else {
+        Err(out.message)
+    }
+}
+
+/// Turn several startup items on or off. Each label is looked up again in a
+/// fresh listing, so only items this app lists can be touched. System
+/// services share one password prompt (or none, with the startup helper).
+/// Returns one outcome per label, in the order given.
+pub fn set_many(labels: &[String], enable: bool) -> Vec<Outcome> {
+    let items = list(&[]);
+    let mut outcomes: Vec<Option<Outcome>> = vec![None; labels.len()];
+    // (index into labels, item) for system services that need root.
+    let mut system: Vec<(usize, &StartupItem)> = Vec::new();
+
+    for (i, label) in labels.iter().enumerate() {
+        if !safe_label(label) {
+            outcomes[i] = Some(Outcome::failed(label, "This item has an unusual name, so it can't be changed from here. Use “Show in Finder” instead."));
+            continue;
+        }
+        let Some(item) = items.iter().find(|it| &it.label == label) else {
+            outcomes[i] = Some(Outcome::failed(
+                label,
+                "That startup item no longer exists.",
+            ));
+            continue;
+        };
+        if item.scope == "system-service" {
+            system.push((i, item));
+        } else {
+            outcomes[i] = Some(match set_agent(label, &item.plist, enable) {
+                Ok(()) => Outcome::done(label, done_text(label, item.scope, enable)),
+                Err(e) => Outcome::failed(label, e),
+            });
+        }
+    }
+
+    if !system.is_empty() {
+        if crate::privhelper::ready() {
+            for (i, item) in &system {
+                outcomes[*i] = Some(
+                    match crate::privhelper::toggle(&item.label, &item.plist, enable) {
+                        Ok(()) => {
+                            Outcome::done(&item.label, done_text(&item.label, item.scope, enable))
+                        }
+                        Err(e) => Outcome::failed(&item.label, e),
+                    },
+                );
+            }
+        } else {
+            for (i, o) in set_system_with_password(&system, enable) {
+                outcomes[i] = Some(o);
+            }
+        }
+    }
+
+    outcomes
+        .into_iter()
+        .zip(labels)
+        .map(|(o, l)| o.unwrap_or_else(|| Outcome::failed(l, "Nothing was changed.")))
+        .collect()
+}
+
+/// Launch agents run in the user's own launchd domain: no password needed.
+fn set_agent(label: &str, plist: &str, enable: bool) -> Result<(), String> {
+    let domain = format!("gui/{}", uid());
+    let target = format!("{domain}/{label}");
+    let first = Command::new("/bin/launchctl")
+        .args([if enable { "enable" } else { "disable" }, &target])
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !first.status.success() {
+        return Err(format!(
+            "macOS refused: {}",
+            String::from_utf8_lossy(&first.stderr).trim()
+        ));
+    }
+    // Load or unload it now too; it's fine if it was already in that state.
+    let _ = if enable {
+        Command::new("/bin/launchctl")
+            .args(["bootstrap", &domain, plist])
+            .output()
+    } else {
+        Command::new("/bin/launchctl")
+            .args(["bootout", &target])
+            .output()
+    };
+    Ok(())
+}
+
+/// The root shell commands for one system service. None if the plist path
+/// could break out of the quoting (labels are already checked by safe_label).
+fn system_shell(label: &str, plist: &str, enable: bool) -> Option<String> {
+    if plist.contains(['\'', '"', '\\']) || !plist.starts_with("/Library/LaunchDaemons/") {
+        return None;
+    }
+    Some(if enable {
+        format!("launchctl enable system/{label}; launchctl bootstrap system '{plist}' 2>/dev/null")
+    } else {
+        format!("launchctl disable system/{label}; launchctl bootout system/{label} 2>/dev/null")
     })
+}
+
+/// Switch system services as root with a single password prompt, then check
+/// the result in a fresh listing instead of trusting the shell.
+fn set_system_with_password(
+    system: &[(usize, &StartupItem)],
+    enable: bool,
+) -> Vec<(usize, Outcome)> {
+    let mut results = Vec::new();
+    let mut cmds = Vec::new();
+    let mut todo = Vec::new();
+    for (i, item) in system {
+        match system_shell(&item.label, &item.plist, enable) {
+            Some(c) => {
+                cmds.push(c);
+                todo.push((*i, *item));
+            }
+            None => results.push((
+                *i,
+                Outcome::failed(&item.label, "This item's file has an unusual name, so it can't be changed from here. Use “Show in Finder” instead."),
+            )),
+        }
+    }
+    if todo.is_empty() {
+        return results;
+    }
+    let verb = if enable { "turn on" } else { "turn off" };
+    let prompt = if let [(_, only)] = todo.as_slice() {
+        format!(
+            "Process Viewer wants to {verb} the system service “{}”.",
+            only.label
+        )
+    } else {
+        format!(
+            "Process Viewer wants to {verb} {} system services.",
+            todo.len()
+        )
+    };
+    let shell = format!("{}; true", cmds.join("; "));
+    if let Err(e) = crate::privhelper::run_as_admin(&shell, &prompt) {
+        for (i, item) in todo {
+            results.push((i, Outcome::failed(&item.label, e.clone())));
+        }
+        return results;
+    }
+    let after = list(&[]);
+    for (i, item) in todo {
+        let now = after
+            .iter()
+            .find(|a| a.label == item.label)
+            .map(|a| a.enabled);
+        results.push((
+            i,
+            if now == Some(enable) {
+                Outcome::done(&item.label, done_text(&item.label, item.scope, enable))
+            } else {
+                Outcome::failed(
+                    &item.label,
+                    format!("macOS didn't {verb} “{}”.", item.label),
+                )
+            },
+        ));
+    }
+    results
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_shell_only_accepts_safe_daemon_paths() {
+        assert_eq!(
+            system_shell("x.y", "/Library/LaunchDaemons/x.y.plist", false).as_deref(),
+            Some("launchctl disable system/x.y; launchctl bootout system/x.y 2>/dev/null")
+        );
+        assert!(system_shell("x.y", "/Library/LaunchDaemons/a'b.plist", true).is_none());
+        assert!(system_shell("x.y", "/Library/LaunchDaemons/a\"b.plist", true).is_none());
+        assert!(system_shell("x.y", "/tmp/x.plist", true).is_none());
+    }
+
+    #[test]
+    fn set_many_reports_each_bad_label_without_touching_anything() {
+        let labels = vec![
+            "a; rm -rf /".to_string(),
+            "no.such.item.process-viewer-test".to_string(),
+        ];
+        let out = set_many(&labels, false);
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|o| !o.ok));
+        assert_eq!(out[0].label, labels[0]);
+        assert!(out[1].message.contains("no longer exists"));
+    }
 
     #[test]
     fn labels() {

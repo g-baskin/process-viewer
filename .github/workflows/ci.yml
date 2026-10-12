@@ -46,4 +46,8 @@ jobs:
 
       - name: Front-end syntax
         working-directory: .
-        run: node --check src/main.js
+        run: node --check src/main.js && node --check src/selection.js
+
+      - name: Front-end tests
+        working-directory: .
+        run: node --test tests/selection.test.js
